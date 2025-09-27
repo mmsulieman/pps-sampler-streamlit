@@ -3,80 +3,20 @@
 # Input: 4 columns -> Woreda | Kebele | Village | HHs
 # Output: Sampled_Villages CSV + Excel (with Diagnostics)
 
-from pathlib import Path
 import io
 import math
 import hashlib
 from typing import Tuple
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-
-# ---------------------------------------------------------
-# Branding assets (logo + favicon)
-# ---------------------------------------------------------
-ASSETS_LOGO = Path("assets/wfp_logo.png")
-ASSETS_FAVICON = Path("assets/favicon.png")
-
-PAGE_ICON = (
-    str(ASSETS_FAVICON) if ASSETS_FAVICON.exists()
-    else (str(ASSETS_LOGO) if ASSETS_LOGO.exists() else None)
-)
-
-# Must be the very first Streamlit call:
 st.set_page_config(
     page_title="Kebele-level PPS Village Sampler",
-    page_icon=PAGE_ICON,   # safe even if None (Streamlit will use default)
+    page_icon="🎯",
     layout="wide"
 )
 
-
-# ---------------------------------------------------------
-# Branded header (logo + title)
-# ---------------------------------------------------------
-def render_header():
-    left, mid, right = st.columns([0.13, 0.74, 0.13])
-
-    with left:
-        if ASSETS_LOGO.exists():
-            st.image(str(ASSETS_LOGO), width=90)
-
-    with mid:
-        st.markdown(
-            """
-            <div style="padding-top:6px;">
-              <h1 style="margin-bottom:0;">Kebele-level PPS Village Sampler</h1>
-              <p style="margin-top:4px; color: gray;">
-                WFP Ethiopia – Somali Region (Jijiga AO)
-              </p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with right:
-        # Reserved for future: About link / Help icon / Version tag
-        pass
-
-    # Optional style tightening
-    st.markdown(
-        """
-        <style>
-          .block-container { padding-top: 1.0rem !important; }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-render_header()
-
-
-# ---------------------------------------------------------
-# Core logic
-# ---------------------------------------------------------
 REQUIRED_COLS = ["woreda", "kebele", "village", "hhs"]
 
 
@@ -85,10 +25,6 @@ def norm_colnames(cols):
 
 
 def read_input(file) -> pd.DataFrame:
-    """
-    Accepts an uploaded file-like object (.xlsx, .xls, .csv)
-    Returns standardized DataFrame with required columns and cleaned types.
-    """
     name = getattr(file, "name", "uploaded")
     ext = str(name).lower().split(".")[-1]
 
@@ -100,7 +36,6 @@ def read_input(file) -> pd.DataFrame:
         except UnicodeDecodeError:
             df = pd.read_csv(file, encoding="cp1252")
     else:
-        # Try CSV fallback
         try:
             df = pd.read_csv(file)
         except Exception:
@@ -111,7 +46,8 @@ def read_input(file) -> pd.DataFrame:
     for c in df.columns:
         if c in ["woreda"]: rename_map[c] = "woreda"
         if c in ["kebele"]: rename_map[c] = "kebele"
-        if c in ["village", "village / ea", "ea", "enumeration area"]: rename_map[c] = "village"
+        if c in ["village", "village / ea", "ea", "enumeration area"]:
+            rename_map[c] = "village"
         if c in ["hhs", "hh", "households", "# households (hh)", "households (hh)", "households (no)"]:
             rename_map[c] = "hhs"
     df = df.rename(columns=rename_map)
@@ -124,17 +60,12 @@ def read_input(file) -> pd.DataFrame:
     for c in ["woreda", "kebele", "village"]:
         df[c] = df[c].astype(str).str.strip()
     df["hhs"] = pd.to_numeric(df["hhs"], errors="coerce").fillna(0).astype(float)
-
-    # Drop non-positive HHs + empty kebele/village rows
-    df = df[(df["hhs"] > 0) & (df["kebele"].str.len() > 0) & (df["village"].str.len() > 0)].copy()
-
+    df = df[df["hhs"] > 0].copy()
+    df = df[(df["kebele"].str.len() > 0) & (df["village"].str.len() > 0)].copy()
     return df
 
 
 def rng_for_group(seed_base, woreda, kebele):
-    """
-    Per-kebele stable RNG when seed_base is provided
-    """
     if seed_base is None or str(seed_base).strip() == "":
         return np.random.default_rng()
     s = f"{seed_base}::{woreda}::{kebele}"
@@ -143,12 +74,8 @@ def rng_for_group(seed_base, woreda, kebele):
 
 
 def pps_select_independent(cum_high, rng, m, avoid_duplicates=True, max_redraws=1000):
-    """
-    Independent PPS draws; optional duplicate-avoidance (re-draws)
-    """
     n = len(cum_high)
-    if n == 0:
-        return []
+    if n == 0: return []
 
     def pick(u):
         idx = np.searchsorted(cum_high, u, side="left")
@@ -166,7 +93,6 @@ def pps_select_independent(cum_high, rng, m, avoid_duplicates=True, max_redraws=
         attempts += 1
 
     if len(selected) < min(m, n):
-        # Fallback to systematic-like fill to complete
         interval = 1.0 / max(min(m, n), 1)
         start = rng.random() * interval
         k = 0
@@ -180,12 +106,8 @@ def pps_select_independent(cum_high, rng, m, avoid_duplicates=True, max_redraws=
 
 
 def pps_select_systematic(cum_high, rng, m):
-    """
-    Systematic PPS: random start in [0, 1/m), then at start + k*(1/m)
-    """
     n = len(cum_high)
-    if n == 0:
-        return []
+    if n == 0: return []
 
     interval = 1.0 / max(m, 1)
     start = rng.random() * interval
@@ -198,7 +120,6 @@ def pps_select_systematic(cum_high, rng, m):
         if idx >= n:
             idx = n - 1
         indices.append(idx)
-    # Deduplicate but preserve order
     seen, uniq = set(), []
     for i in indices:
         if i not in seen:
@@ -208,20 +129,12 @@ def pps_select_systematic(cum_high, rng, m):
 
 
 def sample_kebele(df_k: pd.DataFrame, m: int, method: str, rng, avoid_duplicates=True) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Return (selected_rows, diagnostics) for a kebele
-    """
     df_k = df_k.copy()
     total = df_k["hhs"].sum()
     if total <= 0:
-        df_k["p"] = 0.0
-        df_k["cum_high"] = 0.0
-        df_k["cum_low"] = 0.0
+        df_k["p"], df_k["cum_high"], df_k["cum_low"] = 0.0, 0.0, 0.0
         diag = df_k.copy()
-        diag["method"] = method
-        diag["m_requested"] = m
-        diag["m_final"] = 0
-        diag["selected"] = False
+        diag["method"], diag["m_requested"], diag["m_final"], diag["selected"] = method, m, 0, False
         return df_k.iloc[0:0], diag
 
     df_k["p"] = df_k["hhs"] / total
@@ -232,10 +145,7 @@ def sample_kebele(df_k: pd.DataFrame, m: int, method: str, rng, avoid_duplicates
     m_eff = min(int(m), nvill) if nvill > 0 else 0
     if m_eff <= 0:
         diag = df_k.copy()
-        diag["method"] = method
-        diag["m_requested"] = m
-        diag["m_final"] = 0
-        diag["selected"] = False
+        diag["method"], diag["m_requested"], diag["m_final"], diag["selected"] = method, m, 0, False
         return df_k.iloc[0:0], diag
 
     if method == "Independent":
@@ -256,17 +166,8 @@ def sample_kebele(df_k: pd.DataFrame, m: int, method: str, rng, avoid_duplicates
     return sel, diag
 
 
-def run_pps(
-    df: pd.DataFrame,
-    method: str,
-    m_default: int,
-    threshold_n: int,
-    m_large: int,
-    use_fixed_m: bool,
-    fixed_m: int,
-    seed_base: str,
-    avoid_dups_indep: bool
-):
+def run_pps(df: pd.DataFrame, method: str, m_default: int, threshold_n: int, m_large: int,
+            use_fixed_m: bool, fixed_m: int, seed_base: str, avoid_dups_indep: bool):
     grp_cols = ["woreda", "kebele"]
     sampled_rows, diag_rows, kebele_summary = [], [], []
 
@@ -288,11 +189,7 @@ def run_pps(
         sampled_rows.append(sel)
         diag_rows.append(diag)
         kebele_summary.append({
-            "Woreda": w,
-            "Kebele": k,
-            "#Villages": nvill,
-            "Method": method,
-            "m_used": int(m),
+            "Woreda": w, "Kebele": k, "#Villages": nvill, "Method": method, "m_used": int(m),
             "Total HHs": int(g["hhs"].sum())
         })
 
@@ -310,62 +207,36 @@ def to_excel_bytes(sampled: pd.DataFrame, diagnostics: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-# ---------------------------------------------------------
-# UI — Sidebar (with logo), Upload, Settings, Run, Download
-# ---------------------------------------------------------
-with st.sidebar:
-    if ASSETS_LOGO.exists():
-        st.image(str(ASSETS_LOGO), width=140)
+st.title("🎯 Kebele-level PPS Village Sampler")
+st.caption("Upload a 4-column frame — **Woreda | Kebele | Village | HHs** — to run kebele-level PPS and download sampled villages.")
 
+with st.sidebar:
     st.header("Settings")
 
-    method = st.selectbox(
-        "PPS Method",
-        ["Systematic", "Independent"],
-        index=0,
-        help="Systematic avoids duplicates by design. Independent uses random draws; you can enable duplicate avoidance."
-    )
+    method = st.selectbox("PPS Method", ["Systematic", "Independent"], index=0,
+                          help="Systematic avoids duplicates by design. Independent uses random draws; you can enable duplicate avoidance.")
 
-    avoid_dups_indep = st.checkbox(
-        "(Independent) Avoid duplicates via re-draws",
-        value=True,
-        help="If Independent is selected, re-draw to avoid selecting the same village twice."
-    )
+    avoid_dups_indep = st.checkbox("(Independent) Avoid duplicates via re-draws", value=True,
+                                   help="If Independent is selected, re-draw to avoid selecting the same village twice.")
 
     st.markdown("---")
     st.subheader("m (villages) per kebele")
-
     use_fixed_m = st.checkbox("Use fixed m for all kebeles", value=False)
     if use_fixed_m:
         fixed_m = st.number_input("Fixed m", min_value=1, max_value=30, value=2, step=1)
-        m_default, threshold_n, m_large = 2, 7, 4  # placeholders not used in fixed mode
+        m_default, threshold_n, m_large = 2, 7, 4
     else:
         m_default = st.number_input("Default m", min_value=1, max_value=30, value=2, step=1)
         threshold_n = st.number_input("If kebele has ≥ (villages)", min_value=2, max_value=1000, value=7, step=1)
         m_large = st.number_input("Use m =", min_value=1, max_value=30, value=4, step=1)
-        fixed_m = m_default  # not used in non-fixed mode
+        fixed_m = m_default
 
     st.markdown("---")
-    seed_base = st.text_input(
-        "Random seed (optional)",
-        value="",
-        help="Provide any text/number to reproduce results; seed is applied per kebele."
-    )
+    seed_base = st.text_input("Random seed (optional)", value="",
+                              help="Provide any text/number to reproduce results; seed is applied per kebele.")
 
     st.markdown("---")
-    with st.expander("ℹ️ Help & Notes", expanded=False):
-        st.markdown(
-            """
-            **Input format:** Excel/CSV with headers (case-insensitive): `Woreda, Kebele, Village, HHs`.  
-            **Systematic PPS** (recommended): evenly spaced PPS points → no duplicates.  
-            **Independent PPS:** random draws; enable *Avoid duplicates* to re-draw if needed.  
-            **Reproducibility:** set a *Random seed* (stable per kebele).  
-            **Large files:** consider filtering to relevant woredas per run.  
-            **Outputs:** CSV (same 4 cols) and Excel (adds Diagnostics).
-            """
-        )
-
-st.caption("Upload a 4-column frame — **Woreda | Kebele | Village | HHs** — to run kebele-level PPS and download sampled villages.")
+    st.caption("Tip: You can export both CSV and Excel with diagnostics.")
 
 uploaded = st.file_uploader("Upload Excel/CSV (Woreda | Kebele | Village | HHs)", type=["xlsx", "xls", "csv"])
 
@@ -373,7 +244,6 @@ if uploaded is not None:
     try:
         df = read_input(uploaded)
         st.success(f"Loaded {len(df):,} rows across {df[['woreda','kebele']].drop_duplicates().shape[0]} kebele(s).")
-
         with st.expander("Preview (top 25 rows)"):
             st.dataframe(df.head(25), use_container_width=True)
 
@@ -411,7 +281,6 @@ if uploaded is not None:
             st.subheader("📋 Kebele Summary (method & m used)")
             st.dataframe(summary, use_container_width=True, height=240)
 
-            # Downloads
             st.markdown("### ⬇️ Download Results")
             csv_bytes = sampled.to_csv(index=False).encode("utf-8")
             st.download_button(
